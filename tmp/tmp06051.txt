@@ -1,0 +1,385 @@
+根据您的需求，需要严格按顺序执行：status → stop → status → start → status，每个操作必须等待前一个任务完成（约30分钟）才能开始下一个。以下是完整的Newman解决方案：
+
+方案设计
+
+1. 顺序控制：使用Node.js驱动脚本控制任务顺序
+
+2. 状态传递：通过环境文件传递任务ID和状态
+
+3. 精确等待：执行完成后轮询任务状态
+
+4. 错误处理：任何任务失败则中断流程
+
+文件结构
+
+/automation
+  ├── collection.json          # Postman集合
+  ├── environment.json         # 环境变量文件
+  ├── package.json             # 项目配置
+  └── workflow-runner.js       # 顺序控制脚本
+
+
+1. Postman集合 (collection.json)
+
+{
+  "info": {
+    "name": "Task Automation",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Trigger Status",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "// 验证响应并保存任务ID",
+              "pm.test(\"Status 202 Accepted\", () => pm.response.to.have.status(202));",
+              "const jsonData = pm.response.json();",
+              "pm.environment.set(\"taskId\", jsonData.taskId);",
+              "pm.environment.set(\"currentTaskType\", \"status\");"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"action\": \"status\"}"
+        },
+        "url": {
+          "raw": "https://api.example.com/tasks",
+          "protocol": "https",
+          "host": ["api","example","com"],
+          "path": ["tasks"]
+        }
+      }
+    },
+    {
+      "name": "Trigger Stop",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test(\"Status 202 Accepted\", () => pm.response.to.have.status(202));",
+              "const jsonData = pm.response.json();",
+              "pm.environment.set(\"taskId\", jsonData.taskId);",
+              "pm.environment.set(\"currentTaskType\", \"stop\");"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"action\": \"stop\"}"
+        },
+        "url": {
+          "raw": "https://api.example.com/tasks",
+          "protocol": "https",
+          "host": ["api","example","com"],
+          "path": ["tasks"]
+        }
+      }
+    },
+    {
+      "name": "Trigger Start",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test(\"Status 202 Accepted\", () => pm.response.to.have.status(202));",
+              "const jsonData = pm.response.json();",
+              "pm.environment.set(\"taskId\", jsonData.taskId);",
+              "pm.environment.set(\"currentTaskType\", \"start\");"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"action\": \"start\"}"
+        },
+        "url": {
+          "raw": "https://api.example.com/tasks",
+          "protocol": "https",
+          "host": ["api","example","com"],
+          "path": ["tasks"]
+        }
+      }
+    },
+    {
+      "name": "Check Task Status",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "const jsonData = pm.response.json();",
+              "pm.test(\"任务状态有效\", () => {",
+              "  pm.expect(jsonData.status).to.be.oneOf([\"SUCCESS\", \"FAILED\", \"IN_PROGRESS\"]);",
+              "  return true;",
+              "});",
+              "pm.environment.set(\"lastTaskStatus\", jsonData.status);"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "https://api.example.com/tasks/{{taskId}}",
+          "protocol": "https",
+          "host": ["api","example","com"],
+          "path": ["tasks", "{{taskId}}"]
+        }
+      }
+    }
+  ]
+}
+
+
+2. 环境变量文件 (environment.json)
+
+{
+  "id": "task-env",
+  "name": "Task Environment",
+  "values": [
+    {
+      "key": "taskId",
+      "value": "",
+      "enabled": true
+    },
+    {
+      "key": "currentTaskType",
+      "value": "",
+      "enabled": true
+    },
+    {
+      "key": "lastTaskStatus",
+      "value": "",
+      "enabled": true
+    }
+  ],
+  "_postman_variable_scope": "environment"
+}
+
+
+3. Node.js驱动脚本 (workflow-runner.js)
+
+const newman = require('newman');
+const fs = require('fs');
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// 任务顺序配置
+const TASK_SEQUENCE = [
+  'Trigger Status',
+  'Trigger Stop',
+  'Trigger Status',
+  'Trigger Start',
+  'Trigger Status'
+];
+
+// 更新环境变量
+function updateEnv(key, value) {
+  const envPath = './environment.json';
+  const envData = JSON.parse(fs.readFileSync(envPath));
+  const variable = envData.values.find(v => v.key === key);
+  if (variable) variable.value = value;
+  fs.writeFileSync(envPath, JSON.stringify(envData, null, 2));
+}
+
+// Newman执行封装
+function runNewman(collection, folder, envFile) {
+  return new Promise((resolve, reject) => {
+    newman.run({
+      collection: require(collection),
+      environment: envFile,
+      folder: folder,
+      reporters: 'cli',
+      timeout: 300000 // 5分钟超时
+    }, (err, summary) => {
+      if (err) return reject(err);
+      if (summary.run.failures.length > 0) {
+        reject(new Error(`${folder} 执行失败`));
+      } else {
+        resolve(summary);
+      }
+    });
+  });
+}
+
+// 检查任务状态（轮询）
+async function checkTaskCompletion(maxRetries = 30, delay = 60000) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    console.log(`[${new Date().toISOString()}] 检查任务状态 (尝试 ${attempt}/${maxRetries})`);
+    
+    await runNewman('./collection.json', 'Check Task Status', './environment.json');
+    
+    const envData = JSON.parse(fs.readFileSync('./environment.json'));
+    const status = envData.values.find(v => v.key === 'lastTaskStatus').value;
+    
+    if (status === 'SUCCESS') return true;
+    if (status === 'FAILED') throw new Error('任务执行失败');
+    
+    console.log(`任务进行中，${delay / 1000}秒后重试...`);
+    await sleep(delay);
+  }
+  throw new Error('任务超时未完成');
+}
+
+// 主执行流程
+async function runWorkflow() {
+  try {
+    for (const task of TASK_SEQUENCE) {
+      console.log(`\n=== 开始任务: ${task} ===`);
+      
+      // 执行任务触发
+      await runNewman('./collection.json', task, './environment.json');
+      
+      // 读取当前任务类型
+      const envData = JSON.parse(fs.readFileSync('./environment.json'));
+      const taskType = envData.values.find(v => v.key === 'currentTaskType').value;
+      
+      // 等待任务完成
+      console.log(`\n等待 ${taskType} 任务完成...`);
+      const taskId = envData.values.find(v => v.key === 'taskId').value;
+      console.log(`任务ID: ${taskId}`);
+      
+      await checkTaskCompletion();
+      
+      console.log(`✓ ${taskType} 任务成功完成\n`);
+    }
+    console.log('✅ 所有任务序列成功完成！');
+  } catch (error) {
+    console.error('\n❌ 执行失败:', error.message);
+    process.exit(1);
+  }
+}
+
+// 启动
+runWorkflow();
+
+
+4. package.json
+
+{
+  "name": "task-automation",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "node workflow-runner.js"
+  },
+  "dependencies": {
+    "newman": "^5.3.2"
+  }
+}
+
+
+使用说明
+
+1. 安装依赖：
+
+npm install
+
+
+2. 配置环境：
+
+  • 修改collection.json中的API端点
+
+  • 调整workflow-runner.js中的超时参数（如需）
+
+3. 执行流程：
+
+npm start
+
+
+4. 执行流程输出示例：
+
+=== 开始任务: Trigger Status ===
+Newman 执行输出...
+
+等待 status 任务完成...
+任务ID: TASK-12345
+[2023-10-15T10:00:00Z] 检查任务状态 (尝试 1/30)
+...
+✓ status 任务成功完成
+
+=== 开始任务: Trigger Stop ===
+...
+
+
+关键功能说明
+
+1. 顺序保证：
+
+const TASK_SEQUENCE = [
+  'Trigger Status',
+  'Trigger Stop',
+  'Trigger Status',
+  'Trigger Start',
+  'Trigger Status'
+];
+
+
+2. 状态轮询：
+
+await checkTaskCompletion(); // 默认30分钟轮询
+
+
+3. 错误处理：
+
+  • 任务失败立即中断
+
+  • 超时自动终止流程
+
+  • 详细错误日志
+
+4. 可配置参数：
+
+  • 轮询间隔时间（delay）
+
+  • 最大重试次数（maxRetries）
+
+  • Newman超时阈值
+
+最佳实践建议
+
+1. 性能优化：
+
+// 在checkTaskCompletion函数中添加
+if (attempt > 10) delay = 120000; // 10次后延长轮询间隔
+
+
+2. 日志增强：
+
+const winston = require('winston');
+// 配置详细日志记录
+
+
+3. 结果持久化：
+
+fs.appendFileSync('results.log', `[${taskType}] ${status}\n`);
+
+
+4. 通知机制：
+
+const nodemailer = require('nodemailer');
+// 任务失败时发送邮件通知
+
+
+这个解决方案确保严格按顺序执行任务，每个任务完成后等待约30分钟才开始下一个，并通过Newman提供完整的自动化流程监控。

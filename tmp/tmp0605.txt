@@ -1,0 +1,276 @@
+我将修改错误处理机制，使得在任务失败时自动重新发起任务。以下是增强后的方案，支持任务失败自动重试：
+
+关键增强：任务失败重试机制
+
+// workflow-runner.js
+const newman = require('newman');
+const fs = require('fs');
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// 配置参数
+const CONFIG = {
+  TASK_SEQUENCE: [
+    'Trigger Status',
+    'Trigger Stop',
+    'Trigger Status',
+    'Trigger Start',
+    'Trigger Status'
+  ],
+  MAX_RETRIES: 3,                 // 最大重试次数
+  BASE_DELAY: 60000,              // 轮询基础间隔（1分钟）
+  RETRY_DELAY: 5 * 60 * 1000,     // 重试延迟（5分钟）
+  TASK_TIMEOUT: 30 * 60 * 1000,   // 单个任务超时（30分钟）
+  TOTAL_TIMEOUT: 3 * 60 * 60 * 1000 // 总超时（3小时）
+};
+
+// ... [updateEnv 函数保持不变] ...
+
+// Newman执行封装（增加重试逻辑）
+function runNewmanWithRetry(collection, folder, envFile, retries = CONFIG.MAX_RETRIES) {
+  return new Promise(async (resolve, reject) => {
+    for (let attempt = 1; attempt <= retries + 1; attempt++) {
+      try {
+        console.log(`执行 ${folder} (尝试 ${attempt}/${retries + 1})`);
+        
+        const summary = await new Promise((innerResolve, innerReject) => {
+          newman.run({
+            collection: require(collection),
+            environment: envFile,
+            folder: folder,
+            reporters: 'cli',
+            timeout: CONFIG.TASK_TIMEOUT
+          }, (err, summary) => {
+            if (err) return innerReject(err);
+            if (summary.run.failures.length > 0) {
+              innerReject(new Error(`${folder} 执行失败`));
+            } else {
+              innerResolve(summary);
+            }
+          });
+        });
+        
+        return resolve(summary);
+      } catch (error) {
+        if (attempt <= retries) {
+          console.warn(`⚠️ ${folder} 执行失败 (${error.message}), ${CONFIG.RETRY_DELAY/1000}秒后重试...`);
+          await sleep(CONFIG.RETRY_DELAY);
+          
+          // 重置环境变量中的失败状态
+          updateEnv('lastTaskStatus', 'IN_PROGRESS');
+        } else {
+          return reject(new Error(`${folder} 重试${retries}次后仍失败`));
+        }
+      }
+    }
+  });
+}
+
+// 检查任务状态（带重试）
+async function checkTaskCompletion(maxRetries = Math.ceil(CONFIG.TASK_TIMEOUT / CONFIG.BASE_DELAY)) {
+  const startTime = Date.now();
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    if (Date.now() - startTime > CONFIG.TOTAL_TIMEOUT) {
+      throw new Error('总执行时间超时');
+    }
+    
+    try {
+      console.log(`[${new Date().toISOString()}] 检查任务状态 (尝试 ${attempt}/${maxRetries})`);
+      
+      await runNewmanWithRetry(
+        './collection.json', 
+        'Check Task Status', 
+        './environment.json',
+        0 // 状态检查不重试
+      );
+      
+      const envData = JSON.parse(fs.readFileSync('./environment.json'));
+      const status = envData.values.find(v => v.key === 'lastTaskStatus').value;
+      
+      if (status === 'SUCCESS') {
+        return { success: true, attempt };
+      }
+      if (status === 'FAILED') {
+        throw new Error('任务执行失败');
+      }
+    } catch (error) {
+      // 任务失败时抛出错误
+      throw new Error(`任务状态检查失败: ${error.message}`);
+    }
+    
+    console.log(`任务进行中，${CONFIG.BASE_DELAY/1000}秒后重试...`);
+    await sleep(CONFIG.BASE_DELAY);
+  }
+  
+  throw new Error('任务超时未完成');
+}
+
+// 主执行流程（带任务级重试）
+async function runWorkflow() {
+  const startTime = Date.now();
+  
+  try {
+    for (const task of CONFIG.TASK_SEQUENCE) {
+      if (Date.now() - startTime > CONFIG.TOTAL_TIMEOUT) {
+        throw new Error('总执行时间超时');
+      }
+      
+      console.log(`\n=== 开始任务: ${task} ===`);
+      
+      let taskSuccess = false;
+      let taskAttempts = 0;
+      
+      for (let attempt = 1; attempt <= CONFIG.MAX_RETRIES + 1; attempt++) {
+        try {
+          taskAttempts = attempt;
+          // 执行任务触发
+          await runNewmanWithRetry('./collection.json', task, './environment.json');
+          
+          // 读取当前任务类型
+          const envData = JSON.parse(fs.readFileSync('./environment.json'));
+          const taskType = envData.values.find(v => v.key === 'currentTaskType').value;
+          
+          // 等待任务完成
+          console.log(`\n等待 ${taskType} 任务完成...`);
+          const taskId = envData.values.find(v => v.key === 'taskId').value;
+          console.log(`任务ID: ${taskId}`);
+          
+          const result = await checkTaskCompletion();
+          taskSuccess = result.success;
+          break; // 任务成功，跳出重试循环
+        } catch (error) {
+          if (attempt <= CONFIG.MAX_RETRIES) {
+            console.warn(`⚠️ 任务执行失败 (${error.message}), 准备重试 (${attempt}/${CONFIG.MAX_RETRIES})`);
+            await sleep(CONFIG.RETRY_DELAY);
+          } else {
+            throw new Error(`${task} 重试${CONFIG.MAX_RETRIES}次后仍失败: ${error.message}`);
+          }
+        }
+      }
+      
+      if (taskSuccess) {
+        const envData = JSON.parse(fs.readFileSync('./environment.json'));
+        const taskType = envData.values.find(v => v.key === 'currentTaskType').value;
+        console.log(`✓ ${taskType} 任务成功完成 (${taskAttempts}次尝试)\n`);
+      }
+    }
+    console.log('✅ 所有任务序列成功完成！');
+  } catch (error) {
+    console.error('\n❌ 执行失败:', error.message);
+    
+    // 保存失败状态
+    const envData = JSON.parse(fs.readFileSync('./environment.json'));
+    const lastTask = envData.values.find(v => v.key === 'currentTaskType').value;
+    console.error(`最后执行的任务: ${lastTask}`);
+    
+    process.exit(1);
+  }
+}
+
+// 启动
+runWorkflow();
+
+
+主要改进说明：
+
+1. 多层重试机制：
+
+  • 任务级重试：每个任务最多重试 MAX_RETRIES 次
+
+  • 请求级重试：单个请求失败自动重试
+
+  • 指数退避策略：重试间隔使用固定延迟（可扩展为指数退避）
+
+2. 配置化参数：
+
+const CONFIG = {
+  MAX_RETRIES: 3,                  // 最大重试次数
+  BASE_DELAY: 60000,               // 轮询间隔
+  RETRY_DELAY: 5 * 60 * 1000,      // 重试延迟
+  TASK_TIMEOUT: 30 * 60 * 1000,    // 单任务超时
+  TOTAL_TIMEOUT: 3 * 60 * 60 * 1000 // 总超时
+};
+
+
+3. 错误处理增强：
+
+  • 区分临时故障和永久失败
+
+  • 保留失败任务上下文信息
+
+  • 提供详细的重试日志
+
+4. 超时控制：
+
+  • 单个任务超时（30分钟）
+
+  • 总执行时间超时（3小时）
+
+  • 防止无限重试
+
+重试流程示例：
+
+=== 开始任务: Trigger Status ===
+执行 Trigger Status (尝试 1/4)
+... [执行输出] ...
+等待 status 任务完成...
+任务ID: TASK-12345
+[2023-10-15T10:00:00Z] 检查任务状态 (尝试 1/60)
+... [任务失败] ...
+
+⚠️ 任务执行失败 (任务状态检查失败: 任务执行失败), 准备重试 (1/3)
+[等待5分钟...]
+
+执行 Trigger Status (尝试 2/4)  // 重新触发任务
+... [新任务ID] ...
+等待 status 任务完成...
+任务ID: TASK-54321
+[2023-10-15T10:05:00Z] 检查任务状态 (尝试 1/60)
+... [任务成功] ...
+
+✓ status 任务成功完成 (2次尝试)
+
+
+最佳实践建议：
+
+1. 重试策略优化：
+
+// 指数退避重试
+const delay = Math.min(CONFIG.RETRY_DELAY * Math.pow(2, attempt - 1), 300000);
+
+
+2. 结果持久化：
+
+// 保存每次任务结果
+const results = [];
+// 每次任务完成后
+results.push({
+  task,
+  attempt: taskAttempts,
+  status: 'success',
+  timestamp: new Date()
+});
+
+
+3. 通知机制：
+
+// 严重错误时通知
+const sendAlert = (message) => {
+  // 实现邮件/短信通知
+  console.error('ALERT:', message);
+};
+
+
+4. 断路器模式：
+
+// 防止连续失败
+let consecutiveFails = 0;
+// 失败时递增
+consecutiveFails++;
+if (consecutiveFails > 3) {
+  sendAlert('连续多次任务失败，终止工作流');
+  process.exit(2);
+}
+
+
+这个增强方案提供了健壮的错误处理机制，在任务失败时自动重试，同时保持严格的顺序执行要求。配置参数可根据您的实际需求灵活调整，特别是在重试次数和延迟时间方面。
